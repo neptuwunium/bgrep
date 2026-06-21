@@ -25,7 +25,7 @@
 // or implied, of the copyright holder.
 //
 
-#include <err.h>
+#define _FILE_OFFSET_BITS 64
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,8 +39,9 @@
 #include <getopt.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <limits.h>
 
-#define BGREP_VERSION "0.2"
+#define BGREP_VERSION "0.3"
 
 // The Windows/DOS implementation of read(3) opens files in text mode by default,
 // which means that an 0x1A byte is considered the end of the file unless a non-standard
@@ -50,9 +51,11 @@
 #endif
 
 int bytes_before = 0, bytes_after = 0;
+bool surround_match = false;
 char **original_argv;
 
-void die(const char* msg, ...);
+void err(int eval, const char *msg, ...);
+void die(const char *msg, ...);
 
 void print_char(unsigned char c)
 {
@@ -84,7 +87,7 @@ int ascii2hex(char c)
  * 	 we have to maintain a window of the bytes before which I am too lazy to do
  * 	 right now.
  */
-void dump_context(int fd, unsigned long long pos)
+void dump_context(int fd, unsigned long long pos, int match_len)
 {
 	off_t save_pos = lseek(fd, 0, SEEK_CUR);
 
@@ -95,8 +98,10 @@ void dump_context(int fd, unsigned long long pos)
 	}
 
 	char buf[1024];
-	off_t start = pos - bytes_before;
-	int bytes_to_read = bytes_before + bytes_after;
+	// Ensure we don't attempt to dump from before the file for a context dump.
+	int before = (pos < (unsigned long long)bytes_before) ? (int)pos : bytes_before;
+	off_t start = pos - before;
+	int bytes_to_read = before + bytes_after + (surround_match ? match_len : 0);
 
 	if (lseek(fd, start, SEEK_SET) == (off_t)-1)
 	{
@@ -104,9 +109,9 @@ void dump_context(int fd, unsigned long long pos)
 		return;
 	}
 
-	for (;bytes_to_read;)
+	while (bytes_to_read > 0)
 	{
-		int read_chunk = bytes_to_read > sizeof(buf) ? sizeof(buf) : bytes_to_read;
+		int read_chunk = bytes_to_read > (int)sizeof(buf) ? (int)sizeof(buf) : bytes_to_read;
 		int bytes_read = read(fd, buf, read_chunk);
 
 		if (bytes_read < 0)
@@ -114,16 +119,18 @@ void dump_context(int fd, unsigned long long pos)
 			perror("read");
 			die("Error reading context");
 		}
+		if (bytes_read == 0)
+			break; /* reached end of file before all context was read */
 
-		char* buf_end = buf + bytes_read;
-		char* p = buf;
+		char *buf_end = buf + bytes_read;
+		char *p = buf;
 
-		for (; p < buf_end;p++)
+		for (; p < buf_end; p++)
 		{
 			print_char(*p);
 		}
 
-		bytes_to_read -= read_chunk;
+		bytes_to_read -= bytes_read;
 	}
 
 	putchar('\n');
@@ -157,7 +164,6 @@ void searchfile(const char *filename, int fd, const unsigned char *value, const 
 	{
 		int r;
 
-		memmove(buf, buf + bufsize - len, len);
 		r = read(fd, buf + len, bufsize - len);
 
 		if (r < 0)
@@ -168,7 +174,9 @@ void searchfile(const char *filename, int fd, const unsigned char *value, const 
 			break;
 
 		int o, i;
-		for (o = offset ? 0 : len; o < r; ++o)
+		// Ensure to match only in actually read data.
+		int start = offset < (off_t)len ? (int)((off_t)len - offset) : 0;
+		for (o = start; o < r; ++o)
 		{
 			for (i = 0; i <= len; ++i)
 				if ((buf[o + i] & mask[i]) != value[i])
@@ -179,24 +187,27 @@ void searchfile(const char *filename, int fd, const unsigned char *value, const 
 				unsigned long long pos = (unsigned long long)(offset + o - len);
 				printf("%s: %08llx\n", filename, pos);
 				if (bytes_before || bytes_after)
-					dump_context(fd, pos);
+					dump_context(fd, pos, len + 1);
 			}
 		}
 
-		offset += o;
+		offset += r;
+
+		memmove(buf, buf + r, len);
 	}
 
 	free(buf);
 }
 
-typedef struct Options {
-	char* pattern_path;
-	char* mask_path;
+typedef struct Options
+{
+	char *pattern_path;
+	char *mask_path;
 	bool recurse;
 	bool reverse;
 } Options;
 
-void recurse(const char *path, const unsigned char *value, const unsigned char *mask, int len, const Options* options)
+void recurse(const char *path, const unsigned char *value, const unsigned char *mask, int len, const Options *options)
 {
 	struct stat s;
 	if (stat(path, &s))
@@ -204,7 +215,8 @@ void recurse(const char *path, const unsigned char *value, const unsigned char *
 		perror("stat");
 		return;
 	}
-	if (!options->recurse && S_ISDIR(s.st_mode)) {
+	if (!options->recurse && S_ISDIR(s.st_mode))
+	{
 		errno = EISDIR;
 		err(1, "%s", path);
 	}
@@ -243,7 +255,23 @@ void recurse(const char *path, const unsigned char *value, const unsigned char *
 	closedir(dir);
 }
 
-void die(const char* msg, ...)
+void err(int eval, const char *msg, ...)
+{
+	va_list ap;
+	va_start(ap, msg);
+	int serrno = errno;
+	fprintf(stderr, "%s: ", "bgrep");
+	if (msg != NULL)
+	{
+		vfprintf(stderr, msg, ap);
+		fprintf(stderr, ": ");
+	}
+	fprintf(stderr, "%s\n", strerror(serrno));
+	va_end(ap);
+	exit(eval);
+}
+
+void die(const char *msg, ...)
 {
 	va_list ap;
 	va_start(ap, msg);
@@ -281,10 +309,9 @@ void usage(bool extended)
 		exit(1);
 }
 
-void parse_opts(int argc, char** argv, Options* options)
+void parse_opts(int argc, char **argv, Options *options)
 {
 	int c;
-	char* pattern_path, * mask_path;
 
 	while ((c = getopt(argc, argv, "A:B:C:f:m:rehv")) != -1)
 	{
@@ -298,6 +325,7 @@ void parse_opts(int argc, char** argv, Options* options)
 				break;
 			case 'C':
 				bytes_before = bytes_after = atoi(optarg);
+				surround_match = true;
 				break;
 			case 'f':
 				options->pattern_path = optarg;
@@ -332,7 +360,7 @@ void parse_opts(int argc, char** argv, Options* options)
 
 int main(int argc, char **argv)
 {
-	Options options = { 0 };
+	Options options = {0};
 	unsigned char *value, *mask;
 	int len = 0;
 
@@ -342,12 +370,18 @@ int main(int argc, char **argv)
 	argv += optind; /* advance the pointer to the first non-opt arg */
 	argc -= optind;
 
-	if (options.pattern_path) {
+	if (options.pattern_path)
+	{
 		struct stat st;
-		if (stat(options.pattern_path, &st)) {
+		if (stat(options.pattern_path, &st))
+		{
 			perror(options.pattern_path);
 			exit(3);
 		}
+		if (st.st_size <= 0)
+			die("invalid/empty search string");
+		if (st.st_size > (off_t)INT_MAX)
+			die("pattern too large (%lld bytes)", (long long)st.st_size);
 		size_t maxlen = st.st_size;
 		value = malloc(maxlen);
 		mask = malloc(maxlen);
@@ -357,54 +391,70 @@ int main(int argc, char **argv)
 			die("error allocating memory for search string!\n");
 		}
 
-		FILE* f = fopen(options.pattern_path, "r");
-		if (!f) {
+		FILE *f = fopen(options.pattern_path, "r");
+		if (!f)
+		{
 			perror(options.pattern_path);
 			exit(3);
 		}
 
-		size_t read = 0;
-		while (read < maxlen) {
-			int n = fread(value + read, 1, maxlen, f);
-			if (feof(f) || ferror(f)) {
-				perror(options.pattern_path);
+		size_t nread = 0;
+		while (nread < maxlen)
+		{
+			size_t n = fread(value + nread, 1, maxlen - nread, f);
+			nread += n;
+			if (n == 0)
+			{
+				if (ferror(f))
+					perror(options.pattern_path);
+				else
+					fprintf(stderr, "%s: unexpected end of file\n", options.pattern_path);
 				exit(3);
 			}
-			read += n;
 		}
 		fclose(f);
 		len = maxlen;
 
-		if (!options.mask_path) {
+		if (!options.mask_path)
+		{
 			memset(mask, 0xFF, len);
-		} else {
+		} else
+		{
 			if (stat(options.mask_path, &st))
 			{
 				perror(options.mask_path);
 				exit(3);
 			}
 
-			if (st.st_size != len)
+			if (st.st_size != (off_t)len)
 			{
 				fprintf(stderr,
-						"Mask (%zu bytes) must be the same size as pattern (%u bytes)\n",
-						st.st_size,
+						"Mask (%lld bytes) must be the same size as pattern (%d bytes)\n",
+						(long long)st.st_size,
 						len);
 				exit(3);
 			}
 
 			f = fopen(options.mask_path, "r");
-			read = 0;
-
-			while (read < maxlen)
+			if (!f)
 			{
-				int n = fread(mask + read, 1, maxlen, f);
-				if (feof(f) || ferror(f))
+				perror(options.mask_path);
+				exit(3);
+			}
+			nread = 0;
+
+			while (nread < maxlen)
+			{
+				size_t n = fread(mask + nread, 1, maxlen - nread, f);
+				nread += n;
+				if (n == 0)
 				{
-					perror(options.pattern_path);
+					if (ferror(f))
+						perror(options.mask_path);
+					else
+						fprintf(stderr, "%s: unexpected end of file\n", options.mask_path);
 					exit(3);
 				}
-				read += n;
 			}
 			fclose(f);
 
@@ -412,28 +462,34 @@ int main(int argc, char **argv)
 			for (int i = 0; i < len; i++)
 				value[i] &= mask[i];
 		}
-	} else if (argc == 0) {
+	} else if (argc == 0)
+	{
 		// a pattern is required.
 		usage(false);
 	} else
 	{
 		char *h = *argv++;
 		argc--;
-		enum {MODE_HEX,MODE_TXT,MODE_TXT_ESC} parse_mode = MODE_HEX;
+		enum
+		{
+			MODE_HEX,
+			MODE_TXT,
+			MODE_TXT_ESC
+		} parse_mode = MODE_HEX;
 
 		// Limit the search string dynamically based on the input string.
 		// The contents of value/mask may end up much shorter than argv[1],
 		// but should never be longer.
 		size_t maxlen = strlen(h);
 		value = malloc(maxlen);
-		mask  = malloc(maxlen);
+		mask = malloc(maxlen);
 
 		if (!value || !mask)
 		{
 			die("error allocating memory for search string!\n");
 		}
 
-		while (*h && (parse_mode != MODE_HEX || h[1]) && len < maxlen)
+		while (*h && (parse_mode != MODE_HEX || h[1]) && (size_t)len < maxlen)
 		{
 			int on_quote = (h[0] == '"');
 			int on_esc = (h[0] == '\\');
@@ -492,17 +548,20 @@ int main(int argc, char **argv)
 				if ((v0 == -1) || (v1 == -1))
 				{
 					fprintf(stderr, "invalid hex string!\n");
-					free(value); free(mask);
+					free(value);
+					free(mask);
 					return 2;
 				}
-				value[len] = (v0 << 4) | v1; mask[len++] = 0xFF;
+				value[len] = (v0 << 4) | v1;
+				mask[len++] = 0xFF;
 			}
 		}
 
 		if (!len || *h)
 		{
 			fprintf(stderr, "invalid/empty search string\n");
-			free(value); free(mask);
+			free(value);
+			free(mask);
 			return 2;
 		}
 	}
@@ -530,6 +589,7 @@ int main(int argc, char **argv)
 			recurse(*argv++, value, mask, len, &options);
 	}
 
-	free(value); free(mask);
+	free(value);
+	free(mask);
 	return 0;
 }
