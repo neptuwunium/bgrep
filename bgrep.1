@@ -3,10 +3,10 @@
 bgrep \- a binary grep
 .SH SYNOPSIS
 .B bgrep
-[\fB\-r\fR] [\fB\-B\fR bytes] [\fB\-A\fR bytes] [\fB\-C\fR bytes] <hex> [<path> [...]]
+[\fB\-re\fR] [\fB\-B\fR bytes] [\fB\-A\fR bytes] [\fB\-C\fR bytes] <hex> [<path> [...]]
 .br
 .B bgrep
-[\fB\-r\fR] \fB\-f\fR <pattern path> [\fB\-m\fR <mask path>] [<path> [...]]
+[\fB\-re\fR] \fB\-f\fR <pattern path> [\fB\-m\fR <mask path>] [<path> [...]]
 .SH DESCRIPTION
 A grep(1), but for binary files; searches for hex patterns.
 .PP
@@ -46,6 +46,9 @@ shown in between
 .TP
 .B \-r
 recurse into directories
+.TP
+.B \-e
+reverse hex input
 .TP
 .BR \-f " <file>"
 read the search pattern (in binary) from a file instead of <hex>
